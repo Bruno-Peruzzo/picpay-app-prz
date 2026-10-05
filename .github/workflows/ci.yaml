@@ -41,6 +41,11 @@ env:
 jobs:
   build-push-bump:
     runs-on: ubuntu-latest
+    outputs:
+      # Tag nova (este deploy) e a anterior (penúltima), consumidas pelo job de
+      # janela de rollback.
+      new_tag: ${{ steps.tag.outputs.sha }}
+      prev_tag: ${{ steps.bump.outputs.prev_tag }}
     steps:
       # ----------------------------------------------------------------------
       # 1. Checkout do código da app
@@ -111,12 +116,20 @@ jobs:
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Bump image tag no GitOps
+        id: bump
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$INFRA_BRANCH" "$INFRA_REPO" infra
           cd infra
 
           NEW_TAG="${{ steps.tag.outputs.sha }}"
+          # Captura a tag ANTERIOR (penúltima) ANTES de trocar — é o alvo de um
+          # eventual rollback. Vem direto do que está no arquivo agora, sem
+          # depender de histórico/adivinhação.
+          PREV_TAG=$(grep -E '^[[:space:]]+tag:[[:space:]]*"' "$GITOPS_APP_FILE" | head -1 | sed -E 's#.*tag:[[:space:]]*"([^"]+)".*#\1#')
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+          echo "Tag anterior (alvo de rollback): $PREV_TAG ; nova: $NEW_TAG"
+
           # Atualiza SOMENTE a linha `tag: "..."` dentro do bloco image: do
           # values inline da Application. A âncora é a indentação (image.tag está
           # aninhado em helm.values no YAML inline).
@@ -134,3 +147,77 @@ jobs:
           git add "$GITOPS_APP_FILE"
           git commit -m "ci(picpay-app): bump image tag para $NEW_TAG [skip ci]"
           git push origin "$INFRA_BRANCH"
+
+  # --------------------------------------------------------------------------
+  # check-rollback — valida (SEM gate) se a tag anterior é uma imagem válida no
+  # ECR. Só se for, o job de janela abre o gate de aprovação. No 1º deploy a
+  # anterior é "latest" (não existe no ECR) -> não oferece rollback.
+  # --------------------------------------------------------------------------
+  check-rollback:
+    needs: build-push-bump
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Checar tag anterior no ECR
+        id: check
+        run: |
+          set -euo pipefail
+          PREV="${{ needs.build-push-bump.outputs.prev_tag }}"
+          echo "Tag anterior candidata a rollback: ${PREV:-<vazia>}"
+          if [ -n "$PREV" ] && aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$PREV" >/dev/null 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "Tag anterior $PREV existe no ECR — a janela de rollback vai pedir aprovação."
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "Sem tag anterior válida no ECR — rollback não será oferecido."
+          fi
+
+  # --------------------------------------------------------------------------
+  # rollback-window — Opção B (janela de 15 min com aprovação).
+  #
+  # O gate vem do Environment protegido 'production-rollback' (você como required
+  # reviewer), declarado no NÍVEL DO JOB. Semântica:
+  #   - APROVAR em até 15 min    -> aplica o rollback para a tag anterior.
+  #   - NÃO aprovar / 15 min      -> timeout-minutes cancela o job; o DEPLOY é
+  #     MANTIDO (app segue na tag nova). Job aparece como cancelado = janela
+  #     expirada sem rollback (comportamento esperado).
+  #
+  # Só roda se check-rollback achou uma tag anterior válida (if abaixo).
+  # --------------------------------------------------------------------------
+  rollback-window:
+    needs: [build-push-bump, check-rollback]
+    if: needs.check-rollback.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    environment: production-rollback   # <-- gate de aprovação (nível do job)
+    timeout-minutes: 15                # <-- a janela de 15 min
+    steps:
+      - name: Setup SSH (deploy key do repo de infra)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GITOPS_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Aplicar rollback para a tag anterior
+        run: |
+          set -euo pipefail
+          PREV="${{ needs.build-push-bump.outputs.prev_tag }}"
+          NEW="${{ needs.build-push-bump.outputs.new_tag }}"
+          echo "ROLLBACK aprovado: $NEW -> $PREV"
+          git clone --depth 1 --branch "$INFRA_BRANCH" "$INFRA_REPO" infra
+          cd infra
+          sed -i -E 's#(^[[:space:]]+tag:[[:space:]]*").*(".*)#\1'"$PREV"'\2#' "$GITOPS_APP_FILE"
+          git diff -- "$GITOPS_APP_FILE"
+          git config user.name  "picpay-app-ci"
+          git config user.email "ci@picpay-app-prz.noreply"
+          git add "$GITOPS_APP_FILE"
+          git commit -m "ci(picpay-app): ROLLBACK da imagem $NEW -> $PREV [skip ci]"
+          git push origin "$INFRA_BRANCH"
+          echo "Rollback aplicado — ArgoCD vai reconciliar para $PREV."
