@@ -1,0 +1,130 @@
+# CI da aplicação picpay-app (repo picpay-app-prz).
+#
+# Fluxo (ver docs/howto-github-actions.md no repo de infra):
+#   test -> build/push da imagem no ECR -> bump da tag no repo de infra (GitOps)
+# O ArgoCD, no cluster, detecta o commit no repo de infra e faz o deploy (CD).
+#
+# AUTENTICAÇÃO AWS: por access key de um IAM user dedicado ao CI (secrets
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY). O ideal seria OIDC (sem secret de
+# longa duração), mas a SCP da organização (nova experiência AWS) NEGA
+# iam:CreateOpenIDConnectProvider — o mesmo bloqueio que inviabilizou o IRSA
+# (ver DECISOES D18). Mitigação: o IAM user tem permissão MÍNIMA (apenas push no
+# ECR do projeto), sem nenhum acesso ao cluster.
+#
+# BUMP CROSS-REPO: o CI escreve no repo de INFRA (picpay-challenge-prz) via uma
+# DEPLOY KEY SSH dedicada (secret GITOPS_DEPLOY_KEY), com acesso de escrita só a
+# esse repositório — least privilege.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  # Permite rodar manualmente pela aba Actions.
+  workflow_dispatch:
+
+# Sem OIDC aqui (bloqueado pela SCP), então não precisamos de id-token.
+# contents:read basta — a escrita no repo de infra é feita via deploy key SSH.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: picpay-challenge-app
+  ECR_REGISTRY: 390736326016.dkr.ecr.us-east-2.amazonaws.com
+  # Repo de infra onde vive o GitOps (destino do bump da tag).
+  INFRA_REPO: git@github.com:Bruno-Peruzzo/picpay-challenge-prz.git
+  INFRA_BRANCH: master
+  # Caminho (no repo de infra) do manifesto cuja tag será atualizada.
+  GITOPS_APP_FILE: gitops/apps/picpay-app.yaml
+
+jobs:
+  build-push-bump:
+    runs-on: ubuntu-latest
+    steps:
+      # ----------------------------------------------------------------------
+      # 1. Checkout do código da app
+      # ----------------------------------------------------------------------
+      - name: Checkout (app)
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      # 2. Testes da app Go (gate: não publica imagem se o teste falhar)
+      # ----------------------------------------------------------------------
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Test
+        run: go test ./...
+
+      # ----------------------------------------------------------------------
+      # 3. Autenticação na AWS (access key do IAM user do CI — Opção A)
+      # ----------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ----------------------------------------------------------------------
+      # 4. Login no ECR
+      # ----------------------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ----------------------------------------------------------------------
+      # 5. Build + push da imagem (tag = SHA curto do commit, imutável)
+      # ----------------------------------------------------------------------
+      # O ECR está IMMUTABLE: cada commit gera uma tag única (sha-<commit>), sem
+      # risco de sobrescrever. A tag amarra a imagem ao commit exato (rastreável).
+      - name: Set image tag
+        id: tag
+        run: echo "sha=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.sha }}
+          # Cache de camadas via GitHub Actions (acelera builds subsequentes).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----------------------------------------------------------------------
+      # 6. Bump da tag no repo de infra (GitOps) via deploy key SSH
+      # ----------------------------------------------------------------------
+      - name: Setup SSH (deploy key do repo de infra)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GITOPS_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Bump image tag no GitOps
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$INFRA_BRANCH" "$INFRA_REPO" infra
+          cd infra
+
+          NEW_TAG="${{ steps.tag.outputs.sha }}"
+          # Atualiza SOMENTE a linha `tag: "..."` dentro do bloco image: do
+          # values inline da Application. A âncora é a indentação (image.tag está
+          # aninhado em helm.values no YAML inline).
+          sed -i -E 's#(^[[:space:]]+tag:[[:space:]]*").*(".*)#\1'"$NEW_TAG"'\2#' "$GITOPS_APP_FILE"
+
+          # Mostra a mudança (log do CI) e confirma que algo mudou.
+          git diff -- "$GITOPS_APP_FILE"
+          if git diff --quiet -- "$GITOPS_APP_FILE"; then
+            echo "Nenhuma mudança na tag (já estava em $NEW_TAG). Nada a commitar."
+            exit 0
+          fi
+
+          git config user.name  "picpay-app-ci"
+          git config user.email "ci@picpay-app-prz.noreply"
+          git add "$GITOPS_APP_FILE"
+          git commit -m "ci(picpay-app): bump image tag para $NEW_TAG [skip ci]"
+          git push origin "$INFRA_BRANCH"
