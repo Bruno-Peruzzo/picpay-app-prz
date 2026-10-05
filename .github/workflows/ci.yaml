@@ -84,6 +84,12 @@ jobs:
         id: tag
         run: echo "sha=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
+      # setup-buildx cria um builder com driver docker-container, requisito para
+      # o cache type=gha (o driver 'docker' padrão do runner não suporta cache
+      # export: "Cache export is not supported for the docker driver").
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
