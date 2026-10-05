@@ -1,0 +1,146 @@
+# Rollback manual da aplicação picpay-app (GitOps).
+#
+# Num fluxo GitOps, "rollback" = fazer a tag da imagem no repo de infra voltar
+# para uma versão boa anterior; o ArgoCD reconcilia o cluster para essa tag.
+# Como a Application tem automated+selfHeal, reverter no Git é o caminho correto
+# (um rollback só no ArgoCD seria desfeito pelo selfHeal, que reconverge p/ Git).
+#
+# GATE DE APROVAÇÃO: o job de rollback usa o Environment protegido
+# "production-rollback". Configure-o em Settings > Environments com você como
+# Required reviewer — o workflow PAUSA e só aplica o rollback após sua aprovação.
+#
+# Acionamento: aba Actions > Rollback > Run workflow. Informe target_tag ou
+# deixe vazio para usar a penúltima tag do histórico (a anterior ao deploy atual).
+
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Tag da imagem para onde reverter (ex.: sha-abc123def456). Vazio = penúltima tag do histórico.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: picpay-challenge-app
+  INFRA_REPO: git@github.com:Bruno-Peruzzo/picpay-challenge-prz.git
+  INFRA_BRANCH: master
+  GITOPS_APP_FILE: gitops/apps/picpay-app.yaml
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Job 1 — descobre a tag alvo e VALIDA que ela existe no ECR.
+  # Roda ANTES do gate: se a tag for inválida, nem chega a pedir aprovação.
+  # --------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      target_tag: ${{ steps.resolve.outputs.target_tag }}
+      current_tag: ${{ steps.resolve.outputs.current_tag }}
+    steps:
+      - name: Setup SSH (deploy key do repo de infra)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GITOPS_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Resolver tag alvo (input ou penúltima do histórico)
+        id: resolve
+        run: |
+          set -euo pipefail
+          # Clone com histórico (precisamos do log do arquivo para achar a tag anterior).
+          git clone --branch "$INFRA_BRANCH" "$INFRA_REPO" infra
+          cd infra
+
+          # Tag atualmente aplicada (a que está no arquivo agora).
+          CURRENT=$(grep -E '^[[:space:]]+tag:[[:space:]]*"' "$GITOPS_APP_FILE" | head -1 | sed -E 's#.*tag:[[:space:]]*"([^"]+)".*#\1#')
+          echo "current_tag=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Tag atual: $CURRENT"
+
+          TARGET="${{ github.event.inputs.target_tag }}"
+          if [ -z "$TARGET" ]; then
+            # Penúltima tag = a tag distinta imediatamente anterior à atual no
+            # histórico do arquivo. Percorre os commits que tocaram o arquivo,
+            # extrai a linha tag: de cada versão e pega a primeira != atual.
+            echo "Nenhuma target_tag informada — procurando a penúltima tag no histórico..."
+            TARGET=""
+            for sha in $(git log --format=%H -- "$GITOPS_APP_FILE"); do
+              T=$(git show "$sha:$GITOPS_APP_FILE" 2>/dev/null | grep -E '^[[:space:]]+tag:[[:space:]]*"' | head -1 | sed -E 's#.*tag:[[:space:]]*"([^"]+)".*#\1#' || true)
+              if [ -n "$T" ] && [ "$T" != "$CURRENT" ]; then
+                TARGET="$T"
+                break
+              fi
+            done
+            if [ -z "$TARGET" ]; then
+              echo "::error::Não encontrei uma tag anterior distinta no histórico. Informe target_tag manualmente."
+              exit 1
+            fi
+          fi
+          echo "Tag alvo do rollback: $TARGET"
+          echo "target_tag=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validar que a tag alvo existe no ECR
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.resolve.outputs.target_tag }}"
+          echo "Verificando se $ECR_REPOSITORY:$TARGET existe no ECR..."
+          if ! aws ecr describe-images \
+                --repository-name "$ECR_REPOSITORY" \
+                --image-ids imageTag="$TARGET" >/dev/null 2>&1; then
+            echo "::error::A tag '$TARGET' NÃO existe no ECR. Rollback abortado (evita ImagePullBackOff)."
+            exit 1
+          fi
+          echo "OK: imagem $TARGET existe no ECR."
+
+  # --------------------------------------------------------------------------
+  # Job 2 — aplica o rollback. Preso ao Environment protegido: PAUSA aqui e só
+  # segue após aprovação manual (required reviewer configurado no environment).
+  # --------------------------------------------------------------------------
+  rollback:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: production-rollback   # <-- gate de aprovação (required reviewers)
+    steps:
+      - name: Setup SSH (deploy key do repo de infra)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GITOPS_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Aplicar rollback (bump reverso no GitOps)
+        run: |
+          set -euo pipefail
+          TARGET="${{ needs.prepare.outputs.target_tag }}"
+          CURRENT="${{ needs.prepare.outputs.current_tag }}"
+          echo "Rollback: $CURRENT -> $TARGET"
+
+          git clone --depth 1 --branch "$INFRA_BRANCH" "$INFRA_REPO" infra
+          cd infra
+          sed -i -E 's#(^[[:space:]]+tag:[[:space:]]*").*(".*)#\1'"$TARGET"'\2#' "$GITOPS_APP_FILE"
+
+          git diff -- "$GITOPS_APP_FILE"
+          if git diff --quiet -- "$GITOPS_APP_FILE"; then
+            echo "A tag já era $TARGET. Nada a fazer."
+            exit 0
+          fi
+
+          git config user.name  "picpay-app-ci"
+          git config user.email "ci@picpay-app-prz.noreply"
+          git add "$GITOPS_APP_FILE"
+          git commit -m "ci(picpay-app): ROLLBACK da imagem $CURRENT -> $TARGET [skip ci]"
+          git push origin "$INFRA_BRANCH"
+          echo "Rollback aplicado. O ArgoCD vai reconciliar a app para $TARGET."
