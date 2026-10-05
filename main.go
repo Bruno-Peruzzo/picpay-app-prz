@@ -97,7 +97,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	greetingsTotal.Inc()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("Hello from PicPay EKS Challenge!\n"))
+	_, _ = w.Write([]byte("Hello from PicPay EKS Challenge! Versao 2\n"))
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
