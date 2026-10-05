@@ -68,3 +68,5 @@ Depois, os mesmos `curl` acima.
 
 Ao receber `SIGTERM`/`SIGINT`, o servidor marca `/ready` como 503 (para o
 Kubernetes drenar o tráfego) e encerra as conexões em andamento com timeout.
+
+<!-- ci: trigger rollback-window test 1791243519 -->
