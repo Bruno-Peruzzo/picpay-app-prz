@@ -1,0 +1,21 @@
+# Binários de build
+/server
+/app
+/picpay-app-prz
+*.exe
+*.test
+*.out
+
+# Cobertura de testes
+coverage.*
+*.cover
+
+# Diretórios de ferramentas Go
+/vendor/
+/bin/
+
+# Artefatos de IDE / SO
+.DS_Store
+.idea/
+.vscode/
+*.swp
