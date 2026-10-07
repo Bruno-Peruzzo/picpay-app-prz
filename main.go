@@ -27,10 +27,59 @@ import (
 	"syscall"
 	"time"
 
+	_ "embed"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// logoPNG embute o logo no binário, para que ele viaje junto no build
+// (inclusive na imagem distroless, que não tem o filesystem do projeto).
+//
+//go:embed picpay-logo-png_seeklogo-311424.png
+var logoPNG []byte
+
+// indexHTML é a página servida em "/". Fundo em degradê verde PicPay -> branco,
+// com o logo centralizado. Mantém a palavra "Hello" para o conteúdo da saudação.
+const indexHTML = `<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicPay EKS Challenge</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    background: linear-gradient(160deg, #1c4e88 0%, #ffffff79 100%);
+    color: #0a3d26;
+    text-align: center;
+    padding: 2rem;
+  }
+  .logo {
+    width: 160px;
+    height: auto;
+    filter: drop-shadow(0 8px 24px rgba(0, 0, 0, 0.15));
+  }
+  h1 { font-size: 1.75rem; font-weight: 700; }
+  p { font-size: 1rem; opacity: 0.85; }
+</style>
+</head>
+<body>
+  <img class="logo" src="/logo.png" alt="PicPay">
+  <h1>Hello from PicPay EKS Challenge! Versao 4</h1>
+  <p>Rodando em Amazon EKS com observabilidade Prometheus + Grafana.</p>
+</body>
+</html>
+`
 
 var (
 	// Métricas HTTP padrão (dimensões: método, rota e status).
@@ -96,8 +145,15 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	greetingsTotal.Inc()
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("Hello from PicPay EKS Challenge! Versao 2\n"))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(indexHTML))
+}
+
+// handleLogo serve o PNG embutido no binário.
+func handleLogo(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(logoPNG)
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -129,6 +185,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", instrument("/", handleRoot))
+	mux.HandleFunc("/logo.png", instrument("/logo.png", handleLogo))
 	mux.HandleFunc("/health", instrument("/health", handleHealth))
 	mux.HandleFunc("/ready", instrument("/ready", handleReady))
 	// /metrics não é instrumentado para não poluir as próprias métricas.
