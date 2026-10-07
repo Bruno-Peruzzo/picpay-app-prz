@@ -59,7 +59,7 @@ const indexHTML = `<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     gap: 1.5rem;
-    background: linear-gradient(160deg, #326ae4 0%, #6e6d6db9 100%);
+    background: linear-gradient(160deg, #1c4e88 0%, #ffffff79 100%);
     color: #0a3d26;
     text-align: center;
     padding: 2rem;
@@ -75,7 +75,7 @@ const indexHTML = `<!DOCTYPE html>
 </head>
 <body>
   <img class="logo" src="/logo.png" alt="PicPay">
-  <h1>Hello from PicPay EKS Challenge! Versao 5</h1>
+  <h1>Hello from PicPay EKS Challenge! Versao 4</h1>
   <p>Rodando em Amazon EKS com observabilidade Prometheus + Grafana.</p>
 </body>
 </html>
