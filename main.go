@@ -75,7 +75,7 @@ const indexHTML = `<!DOCTYPE html>
 </head>
 <body>
   <img class="logo" src="/logo.png" alt="PicPay">
-  <h1>Hello from PicPay EKS Challenge! Versao 3</h1>
+  <h1>Hello from PicPay EKS Challenge! Versao 5</h1>
   <p>Rodando em Amazon EKS com observabilidade Prometheus + Grafana.</p>
 </body>
 </html>
