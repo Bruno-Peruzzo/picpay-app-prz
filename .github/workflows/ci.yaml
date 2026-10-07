@@ -89,13 +89,33 @@ jobs:
         id: tag
         run: echo "sha=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
+      # Como o ECR é IMMUTABLE, repetir a pipeline no mesmo commit (ex:
+      # workflow_dispatch) tentaria sobrescrever a tag sha-<commit> e falharia
+      # (TagImmutableException). Então checamos ANTES: se a imagem já existe,
+      # pulamos build/push e seguimos direto para o bump (reaplica a tag no
+      # ambiente), em vez de quebrar o build.
+      - name: Checar se a imagem já existe no ECR
+        id: exists
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.sha }}"
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Imagem $TAG já existe no ECR — build/push será pulado; a tag será reaplicada no ambiente."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Imagem $TAG não existe no ECR — build/push normal."
+          fi
+
       # setup-buildx cria um builder com driver docker-container, requisito para
       # o cache type=gha (o driver 'docker' padrão do runner não suporta cache
       # export: "Cache export is not supported for the docker driver").
       - name: Set up Docker Buildx
+        if: steps.exists.outputs.exists != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push
+        if: steps.exists.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
